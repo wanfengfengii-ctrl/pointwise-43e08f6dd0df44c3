@@ -1,0 +1,15 @@
+{
+  "family_id": "coating",
+  "limit_bps": 500,
+  "protocols": [
+    {"test_id": "A", "null_rate": "1/2", "alpha_bps": 300},
+    {"test_id": "B", "null_rate": "1/2", "alpha_bps": 300},
+    {"test_id": "C", "null_rate": "1/2", "alpha_bps": 200}
+  ],
+  "batches": [
+    {"batch_id": "wear-6", "trials": [["01", true], ["02", true], ["03", true], ["04", true], ["05", true], ["06", true]]},
+    {"batch_id": "wear-5", "trials": [["01", true], ["02", true], ["03", true], ["04", true], ["05", false]]}
+  ],
+  "attempts": [["shift-A", "A", "wear-6"], ["shift-B", "B", "wear-6"], ["shift-C", "C", "wear-5"]],
+  "correction": {"batch_id": "wear-6", "trials": [["01", false], ["02", true], ["03", true], ["04", true], ["05", true], ["06", true]]}
+}
