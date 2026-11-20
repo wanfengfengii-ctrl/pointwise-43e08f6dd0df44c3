@@ -11,6 +11,8 @@ python3 -B check_project.py
 python3 -B -m analysis.workbench demo samples/shift.json
 ```
 
+组交班样例用 `python3 -B -m analysis.workbench demo samples/group_shift.json` 演示重叠组、拒办与重开续领；`python3 -B group_fixture.py` 先用原单项入口再按组入口核对同一组正常数据。
+
 回归入口由运行环境提供。演示从样例读取数据，通过业务接口写入独立的临时工作区，输出在发布失答、重开、撤办和批次更正后的实际结果。传入 `--workspace` 时需指定已有目录，演示使用该目录下独立的临时子目录。
 
 ## 应用接口
@@ -39,6 +41,8 @@ python3 -B -m analysis.workbench --workspace shift-work audit coating
 | `status(request_id)` | 核对柜台的持久结果。柜台尚无终局且分析台也无已知终局时，返回 `pending`。 |
 | `read(report_id)` | 领取冻结正文、原号回执和精确父批。原号为 `R-` 后接原请求号。 |
 | `audit(family_id)` | 返回上限、正式占额、在途承诺和实际可用余额，均以整数基点表示。 |
+
+同族联合签发沿用 `Workspace`，按 `GROUPS.md` 提供 `request_group(group_id, members)`、`publish_group(group_id, event=None)` 与 `group_status(group_id)`；`hold_group(group_id, event=None)` 可先整组预留而不公开。组与单项共用柜台的检验排他资格和族余额，组报告号由组结果给出并与单项 `R-` 号全局互不冲突。
 
 标识符使用非空白字符串并保留原值。检验号在工作区内唯一。空批、非布尔记录以及任何重复试片身份都会拒绝整批。整数族上限为 0–10000，整数登记水平为 1–10000。零假设成功率能取闭区间 [0,1] 的有理数。参数冲突及非法输入报告 `ValueError`，缺少登记、批次、申请、族或可领报告报告 `KeyError`。CLI 的这些输入错误以非零状态退出。`pending`、`insufficient`、`cancelled` 与 `published` 是可识别的业务答复。
 

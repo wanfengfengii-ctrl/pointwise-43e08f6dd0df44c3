@@ -4,6 +4,7 @@ from sqlite3 import Connection
 
 from archive.receipts import find_application_receipt
 from desk.commitments import PublicationCommitment, get_commitment, record_cancellation
+from desk.grouping import member_owner
 from desk.intake import PublicationClaim
 
 
@@ -36,15 +37,24 @@ def outcome_for(db: Connection, claim: PublicationClaim,
 
 
 def lookup_outcome(db: Connection, claim: PublicationClaim) -> PublicationOutcome:
+    if member_owner(db, claim.draft.test_id) is not None:
+        return PublicationOutcome(claim.request_id, claim.draft.test_id, 'pending')
     identity = claim.identity()
     with db:
         db.execute('BEGIN')
         return outcome_for(db, claim, get_commitment(db, identity))
 
 
+def requires_group_guard(db: Connection, test_id: str) -> bool:
+    """True when a group already owns this test at the publication desk."""
+    return member_owner(db, test_id) is not None
+
+
 def settle_cancellation(db: Connection, claim: PublicationClaim,
                         event: PublicationEvent | None = None) -> PublicationOutcome:
     identity = claim.identity()
+    if member_owner(db, claim.draft.test_id) is not None:
+        raise ValueError(f'test {claim.draft.test_id!r} already belongs to a group publication')
     if event is not None:
         event('before_cancel')
     with db:

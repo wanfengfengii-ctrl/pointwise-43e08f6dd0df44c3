@@ -9,6 +9,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from analysis.cancellation import cancel
+from analysis.groups import GroupOutcome, initialize_groups, record_group_outcome, request_group as freeze_group
 from analysis.reconciliation import ApplicationOutcome, project_outcome, resolve_outcome
 from analysis.requests import initialize_applications, record_outcome, request, require_application
 from archive.codec import rational_parts
@@ -20,8 +21,18 @@ from batches.readback import get_sealed_batch
 from batches.revisions import initialize_batches
 from batches.sealing import seal
 from desk.commitments import initialize_commitments
+from desk.grouping import (
+    group_report_id,
+    initialize_grouping,
+    member_request_id as group_member_request_id,
+)
 from desk.intake import resolve_claim
-from desk.publication import publish
+from desk.publication import (
+    group_status as read_group_status,
+    hold_group as hold_group_at_desk,
+    publish,
+    publish_group as publish_group_at_desk,
+)
 from desk.settlement import ReplyUnavailable
 from registry.lookup import read_registration
 from registry.registration import initialize_registry, register
@@ -45,11 +56,13 @@ class Workspace:
                 initialize_batches(self.preparation)
             with self.analysis:
                 initialize_applications(self.analysis)
+                initialize_groups(self.analysis)
             with self.desk:
                 self.desk.execute('BEGIN IMMEDIATE')
                 initialize_commitments(self.desk)
                 initialize_records(self.desk)
                 initialize_receipts(self.desk)
+                initialize_grouping(self.desk)
             self._connections = stack.pop_all()
         return self
 
@@ -97,6 +110,58 @@ class Workspace:
 
     def cancel(self, request_id, event=None):
         return cancel(self.analysis, self.preparation, self.desk, request_id, event)
+
+    def request_group(self, group_id, members):
+        return freeze_group(self.analysis, self.preparation, group_id, members)
+
+    def publish_group(self, group_id, event=None):
+        original = self._require_group(group_id)
+        try:
+            outcome = publish_group_at_desk(self.desk, self.preparation, group_id,
+                                            original.drafts, event)
+        except ReplyUnavailable:
+            outcome = GroupOutcome(group_id, 'pending')
+        return record_group_outcome(self.analysis, self._bound_group_outcome(original, outcome))
+
+    def hold_group(self, group_id, event=None):
+        original = self._require_group(group_id)
+        try:
+            outcome = hold_group_at_desk(self.desk, self.preparation, group_id,
+                                         original.drafts, event)
+        except ReplyUnavailable:
+            outcome = GroupOutcome(group_id, 'pending')
+        return record_group_outcome(self.analysis, self._bound_group_outcome(original, outcome))
+
+    def group_status(self, group_id):
+        original = self._require_group(group_id)
+        outcome = read_group_status(self.desk, group_id)
+        return record_group_outcome(self.analysis, self._bound_group_outcome(original, outcome))
+
+    def _bound_group_outcome(self, original, outcome):
+        """Check that a published group result belongs to the frozen members."""
+        if outcome.status != 'published':
+            return outcome
+        by_test = {draft.test_id: draft for draft in original.drafts}
+        if len(outcome.report_ids) != len(by_test) or len(set(outcome.report_ids)) != len(by_test):
+            raise RuntimeError('published group does not carry one report per frozen member')
+        bound = {}
+        for report_id in outcome.report_ids:
+            saved = read(self.desk, self.preparation, report_id)
+            request_id = saved.receipt.request_id
+            draft = saved.record.draft
+            if draft.test_id not in by_test or by_test[draft.test_id] != draft:
+                raise RuntimeError('group report does not match its frozen draft')
+            if request_id != group_member_request_id(original.group_id, draft.test_id):
+                raise RuntimeError('group report was not issued for its frozen member')
+            bound[draft.test_id] = report_id
+        if set(bound) != set(by_test):
+            raise RuntimeError('published group omits a frozen member')
+        return GroupOutcome(original.group_id, 'published',
+                            tuple(bound[test_id] for test_id in sorted(by_test)))
+
+    def _require_group(self, group_id):
+        from analysis.groups import require_group
+        return require_group(self.analysis, group_id)
 
     def read(self, report_id):
         return read(self.desk, self.preparation, report_id)
@@ -150,6 +215,88 @@ def _run_shift(path: Path, sample: dict) -> dict:
         }
 
 
+def _prepare_sample(work: Workspace, sample: dict) -> None:
+    for protocol in sample['protocols']:
+        test_id, rate, alpha = protocol
+        work.register(sample['family_id'], sample['limit_bps'], test_id, Fraction(rate), alpha)
+    for batch_id, trials in sample['batches'].items():
+        work.seal(batch_id, trials)
+
+
+def _read_group(work: Workspace, outcome) -> list[dict]:
+    rows = []
+    for report_id in outcome.report_ids:
+        saved = work.read(report_id)
+        draft = saved.record.draft
+        rows.append({
+            'report_id': report_id,
+            'test_id': draft.test_id,
+            'batch_id': saved.parent.batch_id,
+            'revision': saved.parent.revision,
+            'p_value': rational_parts(draft.p_value),
+            'significant': draft.significant,
+            'alpha_bps': draft.alpha_bps,
+        })
+    return rows
+
+
+def _run_group_shift(path: Path, sample: dict) -> dict:
+    """Demonstrate overlapping groups that compete for one 500 bps family."""
+    family_id = sample['family_id']
+    groups = sample['groups']
+    correction = sample['correction']
+    with Workspace(path) as work:
+        _prepare_sample(work, sample)
+        frozen = work.request_group('ab', groups['ab'])
+        work.request_group('bc', groups['bc'])
+        work.request_group('cd', groups['cd'])
+        # Reverse order of the same members and revisions freezes to the same request.
+        replay = work.request_group('ab', list(reversed(groups['ab'])))
+        ab = work.publish_group('ab')
+        audit_after_ab = work.audit(family_id)
+        bc = work.publish_group('bc')
+        audit_after_bc = work.audit(family_id)
+        cd = work.publish_group('cd')
+        ab_members = _read_group(work, ab)
+        try:
+            work.read(group_report_id('bc', 'C'))
+            c_claimable = True
+        except KeyError:
+            c_claimable = False
+
+    resume_path = Path(path) / 'resume-demo'
+    with Workspace(resume_path) as work:
+        _prepare_sample(work, sample)
+        work.request_group('resume', groups['ab'])
+        work.hold_group('resume')
+        held = work.audit(family_id)
+        interrupted = work.publish_group('resume', _lose_publication_reply)
+        after_interrupt = work.audit(family_id)
+        work.seal(correction['batch_id'], correction['trials'])
+
+    with Workspace(resume_path) as work:
+        status = work.group_status('resume')
+        reread = work.publish_group('resume')
+        resumed = _read_group(work, reread)
+        return {
+            'frozen': {
+                'ab': [(draft.test_id, draft.batch_id, draft.revision) for draft in frozen.drafts],
+                'reverse_resend_same': replay == frozen,
+            },
+            'ab': {'status': ab.status, 'report_ids': ab.report_ids, 'members': ab_members},
+            'audit_after_ab': audit_after_ab,
+            'bc': {'status': bc.status, 'report_ids': bc.report_ids, 'c_report_claimable': c_claimable},
+            'audit_after_bc': audit_after_bc,
+            'cd': {'status': cd.status, 'report_ids': cd.report_ids},
+            'held_reservation': held,
+            'lost_after_commit': interrupted,
+            'audit_after_interrupt': after_interrupt,
+            'group_status_after_reopen': status,
+            'resumed_members': resumed,
+            'final_audit': work.audit(family_id),
+        }
+
+
 def _as_json(value):
     if isinstance(value, Fraction):
         return rational_parts(value)
@@ -192,7 +339,7 @@ def _parser() -> argparse.ArgumentParser:
         commands.add_parser(name).add_argument('request_id')
     commands.add_parser('read').add_argument('report_id')
     commands.add_parser('audit').add_argument('family_id')
-    commands.add_parser('demo').add_argument('sample', type=Path)
+    commands.add_parser('demo').add_argument('sample', type=Path, nargs='+')
     return parser
 
 
@@ -203,9 +350,14 @@ def main(argv: list[str] | None = None) -> int:
         parser.error('--workspace is required for workspace commands')
     try:
         if args.command == 'demo':
-            sample = json.loads(args.sample.read_text(encoding='utf-8'))
-            with TemporaryDirectory(prefix='material-shift-', dir=args.workspace) as folder:
-                result = _run_shift(Path(folder), sample)
+            result = {}
+            for sample_path in args.sample:
+                sample = json.loads(sample_path.read_text(encoding='utf-8'))
+                runner = _run_group_shift if 'groups' in sample else _run_shift
+                with TemporaryDirectory(prefix='material-shift-', dir=args.workspace) as folder:
+                    result[sample_path.name] = runner(Path(folder), sample)
+            if len(args.sample) == 1:
+                result = result[args.sample[0].name]
         elif args.command == 'init':
             initialize_workspace(args.workspace)
             result = {'workspace': str(args.workspace)}

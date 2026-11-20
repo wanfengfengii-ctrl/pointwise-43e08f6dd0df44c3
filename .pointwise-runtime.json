@@ -2,6 +2,18 @@
   "version": 1,
   "kind": "cli",
   "setup": [],
-  "verify": ["python3", "-B", "check_project.py"],
-  "demo": ["python3", "-B", "-m", "analysis.workbench", "demo", "samples/shift.json"]
+  "verify": [
+    "python3",
+    "-B",
+    "check_project.py"
+  ],
+  "demo": [
+    "python3",
+    "-B",
+    "-m",
+    "analysis.workbench",
+    "demo",
+    "samples/shift.json",
+    "samples/group_shift.json"
+  ]
 }

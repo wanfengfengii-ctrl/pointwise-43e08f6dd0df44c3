@@ -25,8 +25,8 @@ class PublicationClaim:
         )
 
 
-def resolve_claim(preparation: Connection, request_id: str, draft: ReportDraft) -> PublicationClaim:
-    require_id(request_id, 'request ID')
+def check_draft(preparation: Connection, draft: ReportDraft) -> int:
+    """Return the frozen family limit after checking one persisted draft."""
     protocol = read_registration(preparation, draft.test_id)
     if (protocol.family_id, protocol.null_rate, protocol.alpha_bps) != (
         draft.family_id, draft.null_rate, draft.alpha_bps,
@@ -38,7 +38,12 @@ def resolve_claim(preparation: Connection, request_id: str, draft: ReportDraft) 
     if draft.significant is not is_significant(draft.p_value, protocol.alpha_bps):
         raise ValueError('draft conclusion does not match its probability and registered alpha')
     family = read_family(preparation, protocol.family_id)
-    return PublicationClaim(request_id, draft, family.limit_bps)
+    return family.limit_bps
+
+
+def resolve_claim(preparation: Connection, request_id: str, draft: ReportDraft) -> PublicationClaim:
+    require_id(request_id, 'request ID')
+    return PublicationClaim(request_id, draft, check_draft(preparation, draft))
 
 
 def admit_publication(db: Connection, claim: PublicationClaim) -> PublicationCommitment | None:
